@@ -23,6 +23,8 @@
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
+#include <stdlib.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -33,10 +35,14 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define MPU6050_ADDR      (0x68 << 1)
-#define MPU6050_WHO_AM_I  0x75
 #define MPU6050_PWR_MGMT1 0x6B
-#define MPU6050_ACCEL_OUT 0x3B
 #define MPU6050_ACCEL_CFG 0x1C
+#define MPU6050_ACCEL_OUT 0x3B
+
+#define RAD_TO_DEG  57.29578f
+
+// Z ekseni bozukken 1, yeni modül gelince 0 yap
+#define Z_BROKEN    1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -51,9 +57,7 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 int16_t ax_raw, ay_raw, az_raw;
-int16_t gx_raw, gy_raw, gz_raw;
 char msg[128];
-uint8_t who = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -67,7 +71,13 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
+static void format_angle(char *out, float angle)
+{
+    int32_t a10 = (int32_t)(angle * 10.0f);
+    char sign = (a10 < 0) ? '-' : '+';
+    if (a10 < 0) a10 = -a10;
+    sprintf(out, "%c%ld.%ld", sign, (long)(a10 / 10), (long)(a10 % 10));
+}
 /* USER CODE END 0 */
 
 /**
@@ -111,12 +121,12 @@ int main(void)
   HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, MPU6050_PWR_MGMT1, 1, &data, 1, 100);
   HAL_Delay(200);
 
-  // Uyku modundan çık, saat kaynağı gyro X PLL
+  // Uyku modundan çık
   data = 0x01;
   HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, MPU6050_PWR_MGMT1, 1, &data, 1, 100);
   HAL_Delay(100);
 
-  // Accelerometer aralığı ±2g
+  // Accelerometer aralığı ±2g (1 g = 16384)
   data = 0x00;
   HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, MPU6050_ACCEL_CFG, 1, &data, 1, 100);
   HAL_Delay(50);
@@ -129,24 +139,34 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  uint8_t buf[14];
+	  uint8_t buf[6];
+	      char roll_str[12], pitch_str[12];
 
-	      // Kimliği her turda oku, reset basmana gerek kalmaz
-	      HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, MPU6050_WHO_AM_I, 1, &who, 1, 100);
-
-	      // Accel (6 byte) + Sıcaklık (2 byte) + Gyro (6 byte) tek seferde
-	      if (HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, MPU6050_ACCEL_OUT, 1, buf, 14, 100) == HAL_OK)
+	      if (HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, MPU6050_ACCEL_OUT, 1, buf, 6, 100) == HAL_OK)
 	      {
-	          ax_raw = (int16_t)(buf[0]  << 8 | buf[1]);
-	          ay_raw = (int16_t)(buf[2]  << 8 | buf[3]);
-	          az_raw = (int16_t)(buf[4]  << 8 | buf[5]);
-	          gx_raw = (int16_t)(buf[8]  << 8 | buf[9]);
-	          gy_raw = (int16_t)(buf[10] << 8 | buf[11]);
-	          gz_raw = (int16_t)(buf[12] << 8 | buf[13]);
+	          ax_raw = (int16_t)(buf[0] << 8 | buf[1]);
+	          ay_raw = (int16_t)(buf[2] << 8 | buf[3]);
+	          az_raw = (int16_t)(buf[4] << 8 | buf[5]);
 
-	          snprintf(msg, sizeof(msg),
-	                   "WHO=0x%02X | AX=%d AY=%d AZ=%d | GX=%d GY=%d GZ=%d\r\n",
-	                   who, ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw);
+	          // g birimine çevir
+	          float ax = ax_raw / 16384.0f;
+	          float ay = ay_raw / 16384.0f;
+	          float az = az_raw / 16384.0f;
+
+	  #if Z_BROKEN
+	          // Z'yi X ve Y'den tahmin et: toplam 1 g, kart yukarı bakıyor varsayımı
+	          float rest = 1.0f - ax * ax - ay * ay;
+	          if (rest < 0.0f) rest = 0.0f;
+	          az = sqrtf(rest);
+	  #endif
+
+	          float roll  = atan2f(ay, az) * RAD_TO_DEG;
+	          float pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * RAD_TO_DEG;
+
+	          format_angle(roll_str, roll);
+	          format_angle(pitch_str, pitch);
+
+	          snprintf(msg, sizeof(msg), "Roll : %s deg | Pitch : %s deg\r\n", roll_str, pitch_str);
 	      }
 	      else
 	      {
