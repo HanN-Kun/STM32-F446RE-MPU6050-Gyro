@@ -1,0 +1,21 @@
+# STM32CubeIDE Derleme Çıktıları
+Debug/
+Release/
+
+# Geçici ve Derlenmiş İkili Dosyalar
+*.o
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.d
+*.su
+*.dwo
+
+# IDE Geçici Ayar Klasörü
+.settings/
+
+# İşletim Sistemi Dosyaları
+.DS_Store
+Thumbs.db
