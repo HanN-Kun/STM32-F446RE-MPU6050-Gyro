@@ -36,13 +36,17 @@
 /* USER CODE BEGIN PD */
 #define MPU6050_ADDR      (0x68 << 1)
 #define MPU6050_PWR_MGMT1 0x6B
+#define MPU6050_CONFIG    0x1A
+#define MPU6050_GYRO_CFG  0x1B
 #define MPU6050_ACCEL_CFG 0x1C
 #define MPU6050_ACCEL_OUT 0x3B
 
-#define RAD_TO_DEG  57.29578f
+#define RAD_TO_DEG   57.29578f
+#define Z_BROKEN     1
 
-// Z ekseni bozukken 1, yeni modül gelince 0 yap
-#define Z_BROKEN    1
+#define ALPHA        0.98f   // gyro payı
+#define LOOP_MS      10      // her turun süresi
+#define PRINT_EVERY  10      // 10 turda bir yazdır (yaklaşık 100 ms)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -56,8 +60,10 @@ I2C_HandleTypeDef hi2c1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-int16_t ax_raw, ay_raw, az_raw;
 char msg[128];
+float gx_off = 0.0f, gy_off = 0.0f;   // gyro sıfır hatası
+float roll = 0.0f, pitch = 0.0f;      // filtrelenmiş açılar
+uint32_t last_tick = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -78,6 +84,42 @@ static void format_angle(char *out, float angle)
     if (a10 < 0) a10 = -a10;
     sprintf(out, "%c%ld.%ld", sign, (long)(a10 / 10), (long)(a10 % 10));
 }
+
+// Sensörden accel (g) ve gyro (derece/saniye) oku
+static uint8_t mpu_read(float *ax, float *ay, float *az, float *gx, float *gy)
+{
+    uint8_t buf[14];
+    if (HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, MPU6050_ACCEL_OUT, 1, buf, 14, 100) != HAL_OK)
+        return 0;
+
+    int16_t axr = (int16_t)(buf[0]  << 8 | buf[1]);
+    int16_t ayr = (int16_t)(buf[2]  << 8 | buf[3]);
+    int16_t azr = (int16_t)(buf[4]  << 8 | buf[5]);
+    int16_t gxr = (int16_t)(buf[8]  << 8 | buf[9]);
+    int16_t gyr = (int16_t)(buf[10] << 8 | buf[11]);
+
+    *ax = axr / 16384.0f;
+    *ay = ayr / 16384.0f;
+    *az = azr / 16384.0f;
+    *gx = gxr / 131.0f;
+    *gy = gyr / 131.0f;
+
+#if Z_BROKEN
+    // Z'yi X ve Y'den tahmin et (kart yukarı bakıyor varsayımı)
+    float rest = 1.0f - (*ax) * (*ax) - (*ay) * (*ay);
+    if (rest < 0.0f) rest = 0.0f;
+    *az = sqrtf(rest);
+#endif
+    return 1;
+}
+
+// Sadece accelerometer'dan açı hesapla
+static void accel_angles(float ax, float ay, float az, float *r, float *p)
+{
+    *r = atan2f(ay, az) * RAD_TO_DEG;
+    *p = atan2f(-ax, sqrtf(ay * ay + az * az)) * RAD_TO_DEG;
+}
+
 /* USER CODE END 0 */
 
 /**
@@ -113,23 +155,61 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
   uint8_t data = 0;
+  float ax, ay, az, gx, gy;
+  float sum_gx = 0.0f, sum_gy = 0.0f;
+  uint16_t n = 0;
+  uint8_t print_cnt = 0;
 
   HAL_Delay(100);
 
-  // Sensörü sıfırla
+  // Sensörü sıfırla ve uyandır
   data = 0x80;
   HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, MPU6050_PWR_MGMT1, 1, &data, 1, 100);
   HAL_Delay(200);
-
-  // Uyku modundan çık
   data = 0x01;
   HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, MPU6050_PWR_MGMT1, 1, &data, 1, 100);
   HAL_Delay(100);
 
-  // Accelerometer aralığı ±2g (1 g = 16384)
+  // Dahili alçak geçiren filtre (yaklaşık 44 Hz), gürültüyü azaltır
+  data = 0x03;
+  HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, MPU6050_CONFIG, 1, &data, 1, 100);
+
+  // Gyro ±250 derece/saniye, Accel ±2g
   data = 0x00;
+  HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, MPU6050_GYRO_CFG, 1, &data, 1, 100);
   HAL_I2C_Mem_Write(&hi2c1, MPU6050_ADDR, MPU6050_ACCEL_CFG, 1, &data, 1, 100);
   HAL_Delay(50);
+
+  // Gyro kalibrasyonu: kart hareketsizken ortalama sıfır hatasını bul
+  snprintf(msg, sizeof(msg), "Kalibrasyon basladi, karti kipirdatma...\r\n");
+  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+
+  for (int i = 0; i < 200; i++)
+  {
+      if (mpu_read(&ax, &ay, &az, &gx, &gy))
+      {
+          sum_gx += gx;
+          sum_gy += gy;
+          n++;
+      }
+      HAL_Delay(5);
+  }
+  if (n > 0)
+  {
+      gx_off = sum_gx / n;
+      gy_off = sum_gy / n;
+  }
+
+  // Başlangıç açısını accelerometer'dan al
+  if (mpu_read(&ax, &ay, &az, &gx, &gy))
+  {
+      accel_angles(ax, ay, az, &roll, &pitch);
+  }
+
+  snprintf(msg, sizeof(msg), "Hazir.\r\n");
+  HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+
+  last_tick = HAL_GetTick();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -139,42 +219,42 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-	  uint8_t buf[6];
-	      char roll_str[12], pitch_str[12];
-
-	      if (HAL_I2C_Mem_Read(&hi2c1, MPU6050_ADDR, MPU6050_ACCEL_OUT, 1, buf, 6, 100) == HAL_OK)
+	  if (mpu_read(&ax, &ay, &az, &gx, &gy))
 	      {
-	          ax_raw = (int16_t)(buf[0] << 8 | buf[1]);
-	          ay_raw = (int16_t)(buf[2] << 8 | buf[3]);
-	          az_raw = (int16_t)(buf[4] << 8 | buf[5]);
+	          // Geçen süre (saniye)
+	          uint32_t now = HAL_GetTick();
+	          float dt = (now - last_tick) / 1000.0f;
+	          last_tick = now;
+	          if (dt <= 0.0f || dt > 0.5f) dt = LOOP_MS / 1000.0f;
 
-	          // g birimine çevir
-	          float ax = ax_raw / 16384.0f;
-	          float ay = ay_raw / 16384.0f;
-	          float az = az_raw / 16384.0f;
+	          // Gyro sıfır hatasını çıkar
+	          gx -= gx_off;
+	          gy -= gy_off;
 
-	  #if Z_BROKEN
-	          // Z'yi X ve Y'den tahmin et: toplam 1 g, kart yukarı bakıyor varsayımı
-	          float rest = 1.0f - ax * ax - ay * ay;
-	          if (rest < 0.0f) rest = 0.0f;
-	          az = sqrtf(rest);
-	  #endif
+	          // Sadece accelerometer açısı (karşılaştırma için)
+	          float roll_acc, pitch_acc;
+	          accel_angles(ax, ay, az, &roll_acc, &pitch_acc);
 
-	          float roll  = atan2f(ay, az) * RAD_TO_DEG;
-	          float pitch = atan2f(-ax, sqrtf(ay * ay + az * az)) * RAD_TO_DEG;
+	          // Complementary filter
+	          roll  = ALPHA * (roll  + gx * dt) + (1.0f - ALPHA) * roll_acc;
+	          pitch = ALPHA * (pitch + gy * dt) + (1.0f - ALPHA) * pitch_acc;
 
-	          format_angle(roll_str, roll);
-	          format_angle(pitch_str, pitch);
-
-	          snprintf(msg, sizeof(msg), "Roll : %s deg | Pitch : %s deg\r\n", roll_str, pitch_str);
+	          print_cnt++;
+	          if (print_cnt >= PRINT_EVERY)
+	          {
+	              print_cnt = 0;
+	              char ra[12], rf[12], pf[12];
+	              format_angle(ra, roll_acc);
+	              format_angle(rf, roll);
+	              format_angle(pf, pitch);
+	              snprintf(msg, sizeof(msg),
+	                       "Roll(acc): %s | Roll(filtre): %s | Pitch(filtre): %s\r\n",
+	                       ra, rf, pf);
+	              HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
+	          }
 	      }
-	      else
-	      {
-	          snprintf(msg, sizeof(msg), "I2C okuma hatasi!\r\n");
-	      }
 
-	      HAL_UART_Transmit(&huart2, (uint8_t*)msg, strlen(msg), 100);
-	      HAL_Delay(200);
+	      HAL_Delay(LOOP_MS);
   }
   /* USER CODE END 3 */
 }
